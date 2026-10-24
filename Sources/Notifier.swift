@@ -40,4 +40,15 @@ enum Notifier {
             return false
         }
     }
+
+    static func statusText() async -> String {
+        switch await UNUserNotificationCenter.current().notificationSettings().authorizationStatus {
+        case .authorized: return "allowed"
+        case .provisional: return "provisional"
+        case .denied: return "DENIED (enable in Settings > Notifications > DebugKit)"
+        case .notDetermined: return "not asked yet (open the DebugKit app once)"
+        case .ephemeral: return "ephemeral"
+        @unknown default: return "unknown"
+        }
+    }
 }

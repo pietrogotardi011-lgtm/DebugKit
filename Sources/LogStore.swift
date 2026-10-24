@@ -6,9 +6,23 @@ enum LogStore {
     private static let lapsKey = "debug_laps"
     private static let statsKey = "debug_run_stats"
     private static let ctxKey = "debug_context"
+    private static let groupKey = "debug_group"
+    private static let retriesKey = "debug_retries"
+    private static let limitKey = "debug_limit"
+    private static let expireKey = "debug_expire_days"
     private static let lock = NSLock()
-    private static let maxEntries = 1000
-    static let exportName = "DebugKit-log.txt"
+    static let exportBase = "DebugKit-log"
+
+    // MARK: settings
+    static var maxEntries: Int {
+        get { let v = UserDefaults.standard.integer(forKey: limitKey); return v > 0 ? v : 1000 }
+        set { UserDefaults.standard.set(max(newValue, 50), forKey: limitKey) }
+    }
+
+    static var expireDays: Int {
+        get { UserDefaults.standard.integer(forKey: expireKey) }
+        set { UserDefaults.standard.set(max(newValue, 0), forKey: expireKey) }
+    }
 
     // MARK: log
     static func load() -> [LogEntry] {
@@ -22,20 +36,53 @@ enum LogStore {
         return entries
     }
 
-    static func append(label: String, message: String, level: LogLevel = .info) {
-        let ctx = currentContextTag()
-        lock.lock(); defer { lock.unlock() }
-        var entries = loadUnlocked()
-        entries.append(LogEntry(date: Date(), label: label, message: message, level: level, context: ctx))
-        if entries.count > maxEntries { entries.removeFirst(entries.count - maxEntries) }
+    private static func saveUnlocked(_ entries: [LogEntry]) {
         if let data = try? JSONEncoder().encode(entries) {
             UserDefaults.standard.set(data, forKey: key)
         }
     }
 
+    static func append(label: String, message: String, level: LogLevel = .info) {
+        let ctx = currentContextTag()
+        let grp = currentGroup()
+        lock.lock(); defer { lock.unlock() }
+        var entries = loadUnlocked()
+        entries.append(LogEntry(date: Date(), label: label, message: message, level: level, context: ctx, group: grp))
+        let days = expireDays
+        if days > 0 {
+            let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
+            entries.removeAll { $0.date < cutoff && !($0.pinned ?? false) }
+        }
+        let limit = maxEntries
+        while entries.count > limit, let idx = entries.firstIndex(where: { !($0.pinned ?? false) }) {
+            entries.remove(at: idx)
+        }
+        saveUnlocked(entries)
+    }
+
     static func clear() {
         lock.lock(); defer { lock.unlock() }
         UserDefaults.standard.removeObject(forKey: key)
+    }
+
+    static func togglePin(_ id: UUID) {
+        lock.lock(); defer { lock.unlock() }
+        var entries = loadUnlocked()
+        if let i = entries.firstIndex(where: { $0.id == id }) {
+            entries[i].pinned = !(entries[i].pinned ?? false)
+            saveUnlocked(entries)
+        }
+    }
+
+    /// Removes entries older than `days` (pinned entries are kept). Returns how many were removed.
+    static func expire(days: Int) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        var entries = loadUnlocked()
+        let before = entries.count
+        let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
+        entries.removeAll { $0.date < cutoff && !($0.pinned ?? false) }
+        saveUnlocked(entries)
+        return before - entries.count
     }
 
     static func filtered(last n: Int, minLevel: LogLevel? = nil, contains q: String? = nil) -> [LogEntry] {
@@ -47,6 +94,7 @@ enum LogStore {
                 $0.message.lowercased().contains(ql)
                     || $0.label.lowercased().contains(ql)
                     || ($0.context ?? "").lowercased().contains(ql)
+                    || ($0.group ?? "").lowercased().contains(ql)
             }
         }
         return Array(e.suffix(max(n, 1)))
@@ -59,27 +107,56 @@ enum LogStore {
         return entries.map { e in
             let lvl = (e.level ?? .info).rawValue.uppercased()
             let ctx = e.context.map { " [\($0)]" } ?? ""
-            return "[\(f.string(from: e.date))] [\(lvl)]\(ctx) [\(e.label)] \(e.message)"
+            let grp = e.group.map { " {\($0)}" } ?? ""
+            return "[\(f.string(from: e.date))] [\(lvl)]\(ctx)\(grp) [\(e.label)] \(e.message)"
         }.joined(separator: "\n")
+    }
+
+    static func json(_ entries: [LogEntry]) -> String {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        enc.dateEncodingStrategy = .iso8601
+        guard let d = try? enc.encode(entries), let s = String(data: d, encoding: .utf8) else { return "[]" }
+        return s
+    }
+
+    static func csv(_ entries: [LogEntry]) -> String {
+        func esc(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }
+        let iso = ISO8601DateFormatter()
+        var lines = ["time,level,label,run,group,message"]
+        for e in entries {
+            lines.append([iso.string(from: e.date), (e.level ?? .info).rawValue, esc(e.label),
+                          esc(e.context ?? ""), esc(e.group ?? ""), esc(e.message)].joined(separator: ","))
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    static func export(_ entries: [LogEntry], as f: ExportFormat) -> String {
+        switch f {
+        case .text: return format(entries)
+        case .json: return json(entries)
+        case .csv: return csv(entries)
+        }
     }
 
     static func text(last n: Int, minLevel: LogLevel? = nil, contains q: String? = nil) -> String {
         format(filtered(last: n, minLevel: minLevel, contains: q))
     }
 
-    static func exportToDocuments() throws -> Data {
-        let all = format(load())
-        let data = Data(all.utf8)
+    static func exportToDocuments(_ f: ExportFormat) throws -> (data: Data, name: String) {
+        let name = "\(exportBase).\(f.ext)"
+        let data = Data(export(load(), as: f).utf8)
         if let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
-            try data.write(to: dir.appendingPathComponent(exportName), options: .atomic)
+            try data.write(to: dir.appendingPathComponent(name), options: .atomic)
         }
-        return data
+        return (data, name)
     }
 
-    // MARK: run context
-    static func startRun(name: String) -> String {
+    // MARK: run context and trace
+    static func startRun(name: String, trace: Bool) -> String {
         let id = String(UUID().uuidString.prefix(4))
-        let c: [String: String] = ["name": name, "id": id, "start": String(Date().timeIntervalSince1970)]
+        let c: [String: String] = ["name": name, "id": id, "start": String(Date().timeIntervalSince1970),
+                                   "trace": trace ? "1" : "0", "step": "0"]
         UserDefaults.standard.set(c, forKey: ctxKey)
         return id
     }
@@ -90,12 +167,49 @@ enum LogStore {
         return "\(n)#\(i)"
     }
 
-    static func endRun() -> (tag: String, seconds: Double)? {
+    static func endRun() -> (tag: String, seconds: Double, steps: Int)? {
         guard let tag = currentContextTag(),
               let c = UserDefaults.standard.dictionary(forKey: ctxKey) as? [String: String],
               let start = Double(c["start"] ?? "") else { return nil }
+        let steps = Int(c["step"] ?? "0") ?? 0
         UserDefaults.standard.removeObject(forKey: ctxKey)
-        return (tag, Date().timeIntervalSince1970 - start)
+        UserDefaults.standard.removeObject(forKey: groupKey)
+        return (tag, Date().timeIntervalSince1970 - start, steps)
+    }
+
+    /// With Trace Mode on, logs "step N: <action>" so you can see how far a shortcut got.
+    static func step(_ name: String) {
+        guard var c = UserDefaults.standard.dictionary(forKey: ctxKey) as? [String: String],
+              c["trace"] == "1" else { return }
+        let n = (Int(c["step"] ?? "0") ?? 0) + 1
+        c["step"] = String(n)
+        UserDefaults.standard.set(c, forKey: ctxKey)
+        append(label: "TRACE", message: "step \(n): \(name)", level: .info)
+    }
+
+    // MARK: groups
+    static func startGroup(_ name: String) { UserDefaults.standard.set(name, forKey: groupKey) }
+    static func currentGroup() -> String? { UserDefaults.standard.string(forKey: groupKey) }
+    static func endGroup() -> String? {
+        let g = currentGroup()
+        UserDefaults.standard.removeObject(forKey: groupKey)
+        return g
+    }
+
+    // MARK: runs overview
+    static func runs() -> [RunSummary] {
+        var map: [String: [LogEntry]] = [:]
+        for e in load() { if let c = e.context { map[c, default: []].append(e) } }
+        return map.map { tag, es in
+            RunSummary(tag: tag, count: es.count,
+                       errors: es.filter { ($0.level ?? .info) == .error }.count,
+                       warnings: es.filter { ($0.level ?? .info) == .warning }.count,
+                       start: es.map(\.date).min() ?? Date(), end: es.map(\.date).max() ?? Date())
+        }.sorted { $0.end > $1.end }
+    }
+
+    static func entries(forRun tag: String) -> [LogEntry] {
+        load().filter { $0.context == tag }
     }
 
     // MARK: timers and laps
@@ -164,5 +278,31 @@ enum LogStore {
         return all.sorted { $0.value.fails > $1.value.fails }
             .map { "\($0.key): \($0.value.runs) runs, \($0.value.fails) failed" }
             .joined(separator: "\n")
+    }
+
+    // MARK: retry counters
+    static func retry(_ name: String, reset: Bool) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        var r = UserDefaults.standard.dictionary(forKey: retriesKey) as? [String: Int] ?? [:]
+        let n = reset ? 0 : (r[name] ?? 0) + 1
+        r[name] = n
+        UserDefaults.standard.set(r, forKey: retriesKey)
+        return n
+    }
+
+    // MARK: maintenance
+    static func clearEverything() {
+        for k in [key, timersKey, lapsKey, statsKey, ctxKey, groupKey, retriesKey] {
+            UserDefaults.standard.removeObject(forKey: k)
+        }
+    }
+
+    static func storageWorks() -> Bool {
+        let k = "debug_selftest"
+        let token = UUID().uuidString
+        UserDefaults.standard.set(token, forKey: k)
+        let ok = UserDefaults.standard.string(forKey: k) == token
+        UserDefaults.standard.removeObject(forKey: k)
+        return ok
     }
 }
