@@ -38,21 +38,21 @@ struct InspectValueIntent: AppIntent {
 
 struct FailWithMessageIntent: AppIntent {
     static let title: LocalizedStringResource = "Fail With Message"
-    static let description = IntentDescription("Stops the shortcut with your own specific error message when the condition is true.")
+    static let description = IntentDescription("Logs a failure with your message when the condition is true. By default the shortcut keeps running; turn on Stop Shortcut to halt it with that error. Returns true if a failure was logged.")
 
     @Parameter(title: "Message") var message: String
     @Parameter(title: "Fail", default: true) var condition: Bool
+    @Parameter(title: "Stop Shortcut", default: false) var stopShortcut: Bool
 
     static var parameterSummary: some ParameterSummary {
-        Summary("Fail with \(\.$message) if \(\.$condition)")
+        Summary("Log failure \(\.$message) if \(\.$condition), stop shortcut: \(\.$stopShortcut)")
     }
 
-    func perform() async throws -> some IntentResult {
-        if condition {
-            LogStore.append(label: "FAIL", message: message)
-            throw DebugError(message: message)
-        }
-        return .result()
+    func perform() async throws -> some IntentResult & ReturnsValue<Bool> {
+        guard condition else { return .result(value: false) }
+        LogStore.append(label: "FAIL", message: message)
+        if stopShortcut { throw DebugError(message: message) }
+        return .result(value: true)
     }
 }
 
